@@ -21,66 +21,201 @@ class GPAGateway:
             choice: Choice,
             stage: Stage,
             request: Request,
-            additional_instructions: Optional[str]
+            additional_instructions: Optional[str],
+            api_key: Optional[str] = None
     ) -> Message:
-        #TODO:
-        # ℹ️ Cool thing about DIAL that all the apps that implement /chat/completions endpoint within DIAL infrastructure
-        #    can be openai compatible and DIAL SDK supports us with creation of such applications. So, we can use any
-        #    OpenAI compatible client (from openai, azureopenai, langchain, whatever...) and communicate with it like
-        #    with openai LLM through /chat/completions endpoint.
-        #    BZW this app as well implements /chat/completions endpoint.
-        # ---
-        # 1. Create AsyncDial (api_version='2025-01-01-preview')
-        # 2. Make call, you will need to provide such parameters:
-        #       - it should stream response
-        #       - prepared messages with `additional_instructions`
-        #       - `general-purpose-agent` is deployment name that we will call
-        #          Full final URL will be `http://host.docker.internal:8052/openai/deployments/general-purpose-agent/chat/completions`
-        #       - extra_headers={'x-conversation-id': request.headers.get('x-conversation-id')}
-        #         Extra headers are required in this case since we have the logic in GPA for RAG that requires them
-        # 3. Create such variables:
-        #       - content, here we will collect content
-        #       - result_custom_content: CustomContent with empty attachment list, here we will collect attachments
-        #       - stages_map: dict[int, Stage] = {}, here we will the mirrored stages by their indexes
-        # 4. Make async loop through chunks and:
-        #       - get delta and print it to console it will later help you to see what is coming in response from GPA
-        #       - if delta has content append it to the `stage`
-        #       - if delta has custom_content it is time for magic✨
-        #           - if custom_content has attachments then add them to the `result_custom_content` (we will deal with them later)
-        #           - if custom_content has state, as well add it to `result_custom_content`. It is important for us
-        #             since here persisted all the tool calls information that is required to GPA to restore the context
-        #           - And now is magic, we will propagate stages from GPA to out MAS coordinator:
-        #               - make dict with none excluded from the custom_content
-        #               - if it has 'stages':
-        #                   - iterate through them (iterated stage we will name as `stg`) and:
-        #                       - get 'index' from it (each stage has it is index, it is required param)
-        #                       - if `stages_map` contains Stage by such index then:
-        #                           - if `stg` has 'content' then append it to the Stage by index
-        #                           - if `stg` has 'attachments' then iterate through these attachments and add them to the Stage by index
-        #                           - if stg` has 'status' and it is 'completed' then close the stage by index (StageProcessor.close_stage_safely)
-        #                       - otherwise: we need to open the Stage on our side to propagate GPA Stage data, use
-        #                         StageProcessor and don't forget to put it to the `stages_map` by index
-        # 5. Propagate `result_custom_content` to choice.
-        #    ⚠️ Here is the moment that aidial_client.AsyncDial and aidial_sdk has different pydentic models (classes)
-        #       for Attachment, so, you can make such move to handle it `Attachment(**attachment.dict(exclude_none=True))`
-        # 6. Now we need to to save information about conversation with GPA to the MASCoordinator choice state. Create
-        #    dict {_IS_GPA: True, GPA_MESSAGES: result_custom_content.state} and set it to the choice state.
-        # 7. Return assistant message with content
-        raise NotImplementedError()
+        # Create AsyncDial client
+        # The endpoint should be the GPA service endpoint (default: http://localhost:8052)
+        # Get API key from request headers if not provided
+        if not api_key:
+            api_key = request.headers.get('Api-Key') or request.headers.get('api-key') if request.headers else None
+        
+        if not api_key:
+            raise ValueError("API key is required for GPA gateway. Provide it via api_key parameter or Api-Key header.")
+        
+        client = AsyncDial(base_url=self.endpoint, api_version='2025-01-01-preview', api_key=api_key)
+        
+        # Prepare messages for GPA
+        messages = self.__prepare_gpa_messages(request, additional_instructions)
+        
+        # Prepare extra headers
+        extra_headers = {}
+        if request.headers and request.headers.get('x-conversation-id'):
+            extra_headers['x-conversation-id'] = request.headers.get('x-conversation-id')
+        
+        # Make call to general-purpose-agent
+        stream = await client.chat.completions.create(
+            deployment_name="general-purpose-agent",
+            messages=messages,
+            stream=True,
+            extra_headers=extra_headers if extra_headers else None
+        )
+        
+        # Variables for collecting response
+        content = ""
+        result_custom_content = CustomContent(attachments=[], state=None)
+        stages_map: dict[int, Stage] = {}
+        chunk_count = 0
+        
+        from task.logging_config import get_logger
+        logger = get_logger(__name__)
+        
+        # Process streaming response
+        async for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                
+                # Handle content
+                if delta.content:
+                    content += delta.content
+                    chunk_count += 1
+                    # Append to choice - this is the correct way to write content in DIAL SDK
+                    try:
+                        choice.append_content(delta.content)
+                    except Exception as e:
+                        logger.warning(f"Could not append to choice: {e}")
+                
+                # Handle custom_content
+                if delta.custom_content:
+                    # Convert custom_content to dict
+                    if hasattr(delta.custom_content, 'dict'):
+                        custom_content_dict = delta.custom_content.dict(exclude_none=True)
+                    elif hasattr(delta.custom_content, '__dict__'):
+                        custom_content_dict = {k: v for k, v in delta.custom_content.__dict__.items() if v is not None}
+                    else:
+                        custom_content_dict = {}
+                    
+                    # Handle attachments
+                    if 'attachments' in custom_content_dict and custom_content_dict['attachments']:
+                        for attachment in custom_content_dict['attachments']:
+                            if hasattr(attachment, 'dict'):
+                                result_custom_content.attachments.append(
+                                    Attachment(**attachment.dict(exclude_none=True))
+                                )
+                            else:
+                                result_custom_content.attachments.append(
+                                    Attachment(**attachment if isinstance(attachment, dict) else attachment.__dict__)
+                                )
+                    
+                    # Handle state
+                    if 'state' in custom_content_dict and custom_content_dict['state']:
+                        if result_custom_content.state is None:
+                            result_custom_content.state = {}
+                        if isinstance(custom_content_dict['state'], dict):
+                            result_custom_content.state.update(custom_content_dict['state'])
+                    
+                    # Handle stages propagation
+                    if 'stages' in custom_content_dict:
+                        for stg in custom_content_dict['stages']:
+                            if 'index' in stg:
+                                idx = stg['index']
+                                if idx in stages_map:
+                                    # Update existing stage
+                                    existing_stage = stages_map[idx]
+                                    if 'content' in stg:
+                                        try:
+                                            # Write content to choice, not stage
+                                            choice.append_content(stg['content'])
+                                        except:
+                                            pass
+                                    if 'attachments' in stg:
+                                        for attachment in stg['attachments']:
+                                            try:
+                                                if hasattr(attachment, 'dict'):
+                                                    existing_stage.add_attachment(
+                                                        Attachment(**attachment.dict(exclude_none=True))
+                                                    )
+                                                else:
+                                                    existing_stage.add_attachment(
+                                                        Attachment(**attachment if isinstance(attachment, dict) else attachment.__dict__)
+                                                    )
+                                            except:
+                                                pass
+                                    if 'status' in stg and stg['status'] == 'completed':
+                                        StageProcessor.close_stage_safely(existing_stage)
+                                else:
+                                    # Create new stage
+                                    new_stage = StageProcessor.open_stage(choice, stg.get('name'))
+                                    stages_map[idx] = new_stage
+                                    if 'content' in stg:
+                                        try:
+                                            # Write content to choice, not stage
+                                            choice.append_content(stg['content'])
+                                        except:
+                                            pass
+                                    if 'attachments' in stg:
+                                        for attachment in stg['attachments']:
+                                            try:
+                                                if hasattr(attachment, 'dict'):
+                                                    new_stage.add_attachment(
+                                                        Attachment(**attachment.dict(exclude_none=True))
+                                                    )
+                                                else:
+                                                    new_stage.add_attachment(
+                                                        Attachment(**attachment if isinstance(attachment, dict) else attachment.__dict__)
+                                                    )
+                                            except:
+                                                pass
+        
+        # Save GPA conversation state to choice state
+        if result_custom_content.state:
+            choice.set_state({_IS_GPA: True, _GPA_MESSAGES: result_custom_content.state})
+        
+        logger.info(f"GPA response collected - Total chunks: {chunk_count}, Content length: {len(content)}")
+        logger.info(f"GPA response content preview: {content[:200] if content else 'None'}...")
+        
+        # Return assistant message with content and custom_content
+        # Custom content (attachments, state) should be part of the Message, not set on Choice
+        if result_custom_content.attachments or result_custom_content.state:
+            return Message(
+                role=Role.ASSISTANT,
+                content=content,
+                custom_content=result_custom_content
+            )
+        else:
+            return Message(role=Role.ASSISTANT, content=content)
 
     def __prepare_gpa_messages(self, request: Request, additional_instructions: Optional[str]) -> list[dict[str, Any]]:
-        #TODO:
-        # 1. Create `res_messages` empty array, here we will collect all the messages that are related to the GPA agent
-        # 2. Make for i loop through range of len of request messages and:
-        #       - if it is assistant message then:
-        #           - Check if it has custom content and it has state:
-        #               - if state dict has `_IS_GPA` and it is true then:
-        #                   - 1. add to `res_messages` `request.messages[idx-1]` as dict with none excluded. Here we
-        #                     add user message
-        #                   - 2. make deepcopy of message, then set copied message with state from _GPA_MESSAGES add to
-        #                     `res_messages`. What we do here is to restore appropriate format of assistant message for
-        #                     GPA: {_IS_GPA: True, GPA_MESSAGES: {'tool_call_history': [{...}]}} -> {'tool_call_history': [{...}]}
-        # 3. Add last message from `additional_instructions` (it will be user message) as dict with none excluded
-        # 4. If `additional_instructions` are present we need to make augmentation for last message content in the `res_messages`
-        # 5. Return `res_messages`
-        raise NotImplementedError()
+        res_messages = []
+        
+        # Iterate through request messages
+        for idx in range(len(request.messages)):
+            message = request.messages[idx]
+            
+            if message.role == Role.ASSISTANT:
+                # Check if it has custom content with state
+                if message.custom_content and message.custom_content.state:
+                    state = message.custom_content.state
+                    if isinstance(state, dict) and state.get(_IS_GPA) is True:
+                        # Add user message (previous message)
+                        if idx > 0:
+                            user_msg = request.messages[idx - 1]
+                            res_messages.append(user_msg.dict(exclude_none=True))
+                        
+                        # Restore assistant message with state from _GPA_MESSAGES
+                        assistant_msg = deepcopy(message)
+                        if _GPA_MESSAGES in state:
+                            # Create new message with restored state
+                            msg_dict = assistant_msg.dict(exclude_none=True)
+                            if 'custom_content' not in msg_dict:
+                                msg_dict['custom_content'] = {}
+                            if 'state' not in msg_dict.get('custom_content', {}):
+                                msg_dict['custom_content']['state'] = {}
+                            msg_dict['custom_content']['state'] = state[_GPA_MESSAGES]
+                            res_messages.append(msg_dict)
+        
+        # Add last message (user message)
+        if request.messages:
+            last_msg = request.messages[-1]
+            last_msg_dict = last_msg.dict(exclude_none=True)
+            
+            # Augment with additional instructions if present
+            if additional_instructions:
+                if 'content' in last_msg_dict:
+                    last_msg_dict['content'] = f"{last_msg_dict['content']}\n\nAdditional instructions: {additional_instructions}"
+                else:
+                    last_msg_dict['content'] = f"Additional instructions: {additional_instructions}"
+            
+            res_messages.append(last_msg_dict)
+        
+        return res_messages
